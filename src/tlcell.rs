@@ -256,6 +256,15 @@ mod tests {
     }
 
     #[test]
+    fn tlcell_singleton_try_new() {
+        struct Marker;
+        let owner1 = TLCellOwner::<Marker>::try_new();
+        assert!(owner1.is_some());
+        let owner2 = TLCellOwner::<Marker>::try_new();
+        assert!(owner2.is_none());
+    }
+
+    #[test]
     fn tlcell() {
         struct Marker;
         type ACellOwner = TLCellOwner<Marker>;
