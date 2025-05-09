@@ -1,12 +1,16 @@
 use std::any::TypeId;
 use std::cell::UnsafeCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use super::Invariant;
 
 std::thread_local! {
-    static SINGLETON_CHECK: std::cell::RefCell<HashSet<TypeId>> = std::cell::RefCell::new(HashSet::new());
+    /// For each type `Q`, we keep track of whether an instance of
+    /// `TLCellOwner<Q>` exists in the current thread and
+    /// we also keep track of any tasks that are waiting to
+    /// create a new `TLCellOwner<Q>` instance.
+    static SINGLETON_CHECK: std::cell::RefCell<HashMap<TypeId, (bool, Vec<std::task::Waker>)>> = std::cell::RefCell::new(HashMap::new());
 }
 
 struct NotSendOrSync(*const ());
@@ -25,7 +29,30 @@ pub struct TLCellOwner<Q: 'static> {
 
 impl<Q: 'static> Drop for TLCellOwner<Q> {
     fn drop(&mut self) {
-        SINGLETON_CHECK.with(|set| set.borrow_mut().remove(&TypeId::of::<Q>()));
+        SINGLETON_CHECK.with(|singleton| {
+            let mut set = singleton.borrow_mut();
+
+            // Get the occupied entry for the owner type:
+            let std::collections::hash_map::Entry::Occupied(mut entry) =
+                set.entry(TypeId::of::<Q>())
+            else {
+                // Cannot logically happen but then the singleton state
+                // is already valid, so it is fine to return early:
+                return;
+            };
+            let (exist, wakers) = entry.get_mut();
+
+            // We are dropping the owner, we allow creating it again:
+            *exist = false;
+
+            // If there is any task waiting to get the owner, wake one of them:
+            if let Some(waker) = wakers.pop() {
+                waker.wake();
+            } else {
+                // No task is waiting to get the owner, we can remove it from the set:
+                set.remove(&TypeId::of::<Q>());
+            }
+        });
     }
 }
 
@@ -55,12 +82,79 @@ impl<Q: 'static> TLCellOwner<Q> {
     /// of this type `Q` already exists in this thread, this returns
     /// `None` instead of panicking.
     pub fn try_new() -> Option<Self> {
-        SINGLETON_CHECK
-            .with(|set| set.borrow_mut().insert(TypeId::of::<Q>()))
-            .then_some(Self {
+        let owner_already_exist = SINGLETON_CHECK.with(|singleton| {
+            let mut set = singleton.borrow_mut();
+
+            // Get our entry or insert default values
+            // and access the bool's value:
+            let exist_mut = &mut set.entry(TypeId::of::<Q>()).or_default().0;
+
+            // Replace the bool in singleton with `true`
+            // and return the previous value:
+            std::mem::replace(exist_mut, true)
+        });
+
+        if owner_already_exist {
+            None
+        } else {
+            Some(Self {
                 not_send_or_sync: PhantomData,
                 typ: PhantomData,
             })
+        }
+    }
+
+    /// Same as [`TLCellOwner::new`], except if another `TLCellOwner`
+    /// of this type `Q` already exists, this puts the current task to
+    /// sleep until the other instance is dropped to return the owner
+    /// when awaited. This will of course deadlock if that other
+    /// instance is owned by the same task.
+    pub async fn sleep_for_new() -> TLCellOwner<Q> {
+        struct SleepForNew<Q> {
+            marker: PhantomData<Invariant<Q>>,
+        }
+
+        impl<Q: 'static> std::future::Future for SleepForNew<Q> {
+            type Output = TLCellOwner<Q>;
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                SINGLETON_CHECK.with(|singleton| {
+                    // We perform one borrow to try to get the owner and to access registered wakers:
+                    let set = &mut *singleton.borrow_mut();
+                    let (exist_mut, wakers) = &mut set.entry(TypeId::of::<Q>()).or_default();
+
+                    // If we can get the owner, we return it and we are done:
+                    if !std::mem::replace(exist_mut, true) {
+                        std::task::Poll::Ready(TLCellOwner {
+                            not_send_or_sync: PhantomData,
+                            typ: PhantomData,
+                        })
+                    } else {
+                        // Otherwise, we need to wait for the owner to be dropped:
+                        let current_waker = cx.waker();
+
+                        // If the waker is not in the set, clone and add it.
+                        // Notice that we must perform this check because
+                        // if we register the same waker twice, we could
+                        // deadlock once the associated task is finished and
+                        // the same waker is awakened again for nothing on drop.
+                        if wakers.iter().all(|w| !w.will_wake(current_waker)) {
+                            wakers.push(current_waker.clone());
+                        }
+
+                        std::task::Poll::Pending
+                    }
+                })
+            }
+        }
+
+        SleepForNew {
+            marker: PhantomData,
+        }
+        .await
     }
 
     /// Create a new cell owned by this owner instance.  See also
@@ -290,6 +384,90 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tlcell_sleep_for_new_in_100_tasks() {
+        use rand::Rng;
+        use std::rc::Rc;
+        struct Marker;
+        type ACellOwner = TLCellOwner<Marker>;
+        type ACell = TLCell<Marker, i32>;
+        let cell_rc = Rc::new(ACell::new(0));
+        let mut handles = vec![];
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                for _ in 0..100 {
+                    let cell_rc_clone = cell_rc.clone();
+                    let handle = tokio::task::spawn_local(async move {
+                        // wait a bit
+                        let mut rng = rand::thread_rng();
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            rng.gen_range(0..10),
+                        ))
+                        .await;
+                        // create a new owner
+                        let mut owner = ACellOwner::sleep_for_new().await;
+                        // read the cell's current value
+                        let current_cell_val = *owner.ro(&*cell_rc_clone);
+                        // wait a bit more
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            rng.gen_range(0..10),
+                        ))
+                        .await;
+                        // write the old cell value + 1 to the cell
+                        // (no other thread should have been able to modify the cell in the
+                        // meantime because we still hold on to the owner)
+                        *owner.rw(&*cell_rc_clone) = current_cell_val + 1;
+                    });
+                    handles.push(handle);
+                }
+                for handle in handles {
+                    assert!(handle.await.is_ok());
+                }
+                let owner = ACellOwner::sleep_for_new().await;
+                assert_eq!(*owner.ro(&*cell_rc), 100);
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn tlcell_sleep_for_new_timeout() {
+        async fn assert_time_out<F, Fut>(d: std::time::Duration, f: F)
+        where
+            F: FnOnce() -> Fut + 'static,
+            Fut: std::future::Future<Output = ()> + 'static,
+        {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let _handle = tokio::task::spawn_local(async move {
+                let val = f().await;
+                done_tx.send(()).unwrap();
+                val
+            });
+
+            assert!(
+                tokio::select! {
+                    _ = done_rx => false,
+                    _ = tokio::time::sleep(d) => true,
+                },
+                "ACellOwner::wait_for_new completed (but it shouldn't have)"
+            );
+        }
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                assert_time_out(std::time::Duration::from_millis(1000), || async move {
+                    struct Marker;
+                    type ACellOwner = TLCellOwner<Marker>;
+
+                    let _owner1 = ACellOwner::new();
+                    let _owner2 = ACellOwner::sleep_for_new().await;
+                })
+                .await;
+            })
+            .await;
     }
 
     #[test]
